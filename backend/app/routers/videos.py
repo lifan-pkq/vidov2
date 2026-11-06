@@ -1,0 +1,259 @@
+"""视频库：列表/详情/播放流（支持 Range）/封面上传导入/重命名/删除。"""
+import asyncio
+import os
+import re
+import tempfile
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.routing import APIRoute
+from pydantic import BaseModel
+
+from app.config import COVERS_DIR, MAX_UPLOAD_MB, TMP_DIR, VIDEOS_DIR, ensure_dirs
+from app.db import add_video, delete_video, get_video, list_videos, update_video
+from app.services.media import ensure_h264, make_cover, probe_video, range_stream
+
+
+class UploadSizeGuardRoute(APIRoute):
+    """在 multipart body 被解析之前，用 Content-Length 早拒超大上传。
+
+    FastAPI 的依赖（Depends）在 get_request_handler 里是「先 await request.form()，
+    再 solve_dependencies」，所以依赖永远晚于 body 读取；路由 handler 包在 body
+    解析之外，是应用层最早能执行的点。
+    """
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def guarded(request: Request):
+            if request.url.path.rstrip("/").endswith("/upload"):
+                try:
+                    declared = int(request.headers.get("content-length") or 0)
+                except ValueError:
+                    declared = 0
+                if declared > MAX_UPLOAD_MB * 1024 * 1024 + 1024 * 1024:
+                    raise HTTPException(413, f"文件超过大小上限（{MAX_UPLOAD_MB}MB）")
+            return await handler(request)
+
+        return guarded
+
+
+router = APIRouter(prefix="/api/videos", tags=["videos"], route_class=UploadSizeGuardRoute)
+
+UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024  # 1MB->8MB：上传大文件时 syscall 数降一个数量级
+ALLOWED_SUFFIXES = {".mp4", ".mov", ".webm", ".mkv", ".flv", ".avi"}
+
+
+def _serialize(v: dict) -> dict:
+    return {
+        **v,
+        "file_url": f"/api/videos/{v['id']}/file",
+        "cover_url": f"/api/videos/{v['id']}/cover" if v.get("cover") else None,
+    }
+
+
+@router.get("")
+def get_videos():
+    return [_serialize(v) for v in list_videos()]
+
+
+@router.get("/{video_id}")
+def get_video_detail(video_id: int):
+    v = get_video(video_id)
+    if not v:
+        raise HTTPException(404, "视频不存在")
+    return _serialize(v)
+
+
+@router.get("/{video_id}/file")
+def stream_video(video_id: int, request: Request):
+    v = get_video(video_id)
+    if not v:
+        raise HTTPException(404, "视频不存在")
+    path = VIDEOS_DIR / v["filename"]
+    if not path.exists():
+        raise HTTPException(404, "视频文件已丢失")
+    return range_stream(path, request.headers.get("range"))
+
+
+@router.get("/{video_id}/download")
+def download_video(video_id: int):
+    """浏览器直接下载成片到本机（不额外占用服务器空间）。"""
+    v = get_video(video_id)
+    if not v:
+        raise HTTPException(404, "视频不存在")
+    path = VIDEOS_DIR / v["filename"]
+    if not path.exists():
+        raise HTTPException(404, "视频文件已丢失")
+    safe_title = re.sub(r'[\\/:*?"<>|#\n\r]', "_", str(v.get("title") or path.stem))[:80] or path.stem
+    return FileResponse(path, media_type="video/mp4", filename=f"{safe_title}{path.suffix or '.mp4'}")
+
+
+@router.get("/{video_id}/cover")
+def get_cover(video_id: int):
+    v = get_video(video_id)
+    if not v or not v.get("cover"):
+        raise HTTPException(404, "无封面")
+    path = COVERS_DIR / v["cover"]
+    if not path.exists():
+        raise HTTPException(404, "封面文件已丢失")
+    return FileResponse(path)
+
+
+@router.post("/upload")
+async def upload_video(file: UploadFile = File(...), title: str = ""):
+    """从本地上传一个视频导入视频库。"""
+    ensure_dirs()
+    original_name = Path(file.filename or "video.mp4")
+    suffix = original_name.suffix.lower()
+    if suffix not in ALLOWED_SUFFIXES:
+        raise HTTPException(400, f"不支持的文件类型（仅支持 {' '.join(sorted(ALLOWED_SUFFIXES))}）")
+    safe_title = re.sub(r'[\\/:*?"<>|#\n\r]', "_", original_name.stem)[:80] or "video"
+    final = VIDEOS_DIR / f"{uuid.uuid4().hex}{suffix}"
+    cover_path = COVERS_DIR / f"{final.stem}.jpg"
+    tmp_path = None
+    completed = False
+    try:
+        with tempfile.NamedTemporaryFile(
+                prefix="upload-", suffix=suffix, dir=TMP_DIR, delete=False) as f:
+            tmp_path = Path(f.name)
+            size = 0
+            while chunk := await file.read(UPLOAD_CHUNK_BYTES):
+                size += len(chunk)
+                if size > MAX_UPLOAD_MB * 1024 * 1024:
+                    raise HTTPException(413, f"文件超过大小上限（{MAX_UPLOAD_MB}MB）")
+                f.write(chunk)
+
+        meta = await asyncio.to_thread(probe_video, tmp_path)
+        if not any(meta.get(key) is not None for key in ("codec", "width", "height")):
+            raise HTTPException(400, "文件不包含有效视频流")
+        if meta.get("codec") != "h264":
+            converted = await asyncio.to_thread(ensure_h264, tmp_path)
+            if not converted:
+                raise RuntimeError("非 H.264 视频转码失败，请检查 ffmpeg 是否可用")
+        cover = cover_path.name if await asyncio.to_thread(make_cover, tmp_path, cover_path) else None
+        os.replace(tmp_path, final)
+        video = add_video(
+            title=title.strip() or safe_title,
+            filename=final.name,
+            size=size,
+            duration=meta.get("duration"),
+            width=meta.get("width"),
+            height=meta.get("height"),
+            cover=cover,
+            source_platform="local",
+            source_url=None,
+        )
+        from app.services.quality import update_quality
+        from app.services.understanding import start_analysis
+
+        await asyncio.to_thread(update_quality, video["id"], final)
+        start_analysis(video["id"])
+        completed = True
+        return _serialize(video)
+    finally:
+        await file.close()
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+            tmp_path.with_suffix(".h264tmp.mp4").unlink(missing_ok=True)
+        if not completed:
+            final.unlink(missing_ok=True)
+            cover_path.unlink(missing_ok=True)
+
+
+@router.delete("/{video_id}")
+def remove_video(video_id: int):
+    v = get_video(video_id)
+    if not v:
+        raise HTTPException(404, "视频不存在")
+    for folder, name in ((VIDEOS_DIR, v["filename"]), (COVERS_DIR, v.get("cover"))):
+        if name:
+            p = folder / name
+            if p.exists():
+                p.unlink()
+    delete_video(video_id)
+    return {"ok": True}
+
+
+class RenameRequest(BaseModel):
+    title: str
+
+
+@router.patch("/{video_id}")
+def rename_video(video_id: int, req: RenameRequest):
+    """重命名视频标题（只改元数据，不动文件）。"""
+    v = get_video(video_id)
+    if not v:
+        raise HTTPException(404, "视频不存在")
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(400, "标题不能为空")
+    if len(title) > 120:
+        raise HTTPException(400, "标题过长（最长 120 字）")
+    update_video(video_id, title=title)
+    return _serialize(get_video(video_id))
+
+
+class TrimRequest(BaseModel):
+    """截取时间段（秒，支持小数）。"""
+
+    start: float
+    end: float
+
+
+@router.post("/{video_id}/trim")
+def trim_video(video_id: int, req: TrimRequest):
+    """ffmpeg 无损截取（-c copy）生成新视频入库，原视频不动。"""
+    import shutil
+    import subprocess
+
+    v = get_video(video_id)
+    if not v:
+        raise HTTPException(404, "视频不存在")
+    src = VIDEOS_DIR / v["filename"]
+    if not src.exists():
+        raise HTTPException(404, "视频文件已丢失")
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(500, "服务器未安装 ffmpeg")
+    start, end = round(req.start, 2), round(req.end, 2)
+    if start < 0 or end <= start:
+        raise HTTPException(400, "时间区间不合法（需 0 ≤ start < end）")
+    if v.get("duration") and end > v["duration"] + 0.5:
+        raise HTTPException(400, f"结束时间超出视频时长（{v['duration']:.1f}s）")
+
+    stem = f"{src.stem}_截取{int(start)}-{int(end)}"
+    final = VIDEOS_DIR / f"{stem}.mp4"
+    n = 1
+    while final.exists():
+        final = VIDEOS_DIR / f"{stem}_{n}.mp4"
+        n += 1
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-ss", str(start), "-to", str(end), "-i", str(src),
+             "-c", "copy", "-avoid_negative_ts", "make_zero", str(final)],
+            capture_output=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(500, "截取超时")
+    if r.returncode != 0 or not final.exists() or final.stat().st_size == 0:
+        if final.exists():
+            final.unlink()
+        raise HTTPException(500, "截取失败：" + r.stderr.decode("utf-8", errors="replace")[-300:])
+
+    meta = probe_video(final)
+    cover_name = final.stem + ".jpg"
+    cover = cover_name if make_cover(final, COVERS_DIR / cover_name) else None
+    video = add_video(
+        title=f"{v['title']}（截取 {int(start)}s-{int(end)}s）",
+        filename=final.name,
+        size=final.stat().st_size,
+        duration=meta.get("duration"),
+        width=meta.get("width"),
+        height=meta.get("height"),
+        cover=cover,
+        source_platform=v.get("source_platform"),
+        source_url=v.get("source_url"),
+    )
+    return _serialize(video)

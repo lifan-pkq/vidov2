@@ -1,0 +1,33 @@
+# 敏感数据（绝不提交）
+publisher/cookies/
+data/
+.env
+*.netscape.txt
+
+# 依赖与构建产物
+node_modules/
+frontend/dist/
+.venv/
+**/__pycache__/
+*.pyc
+
+# 运行时与浏览器
+ms-playwright/
+publisher/logs/
+publisher/media/
+publisher/db/
+
+# NarratoAI 与共享服务运行数据
+narratoai/config.toml*
+narratoai/storage/
+narratoai/.cache/
+narratoai/resource/scripts/
+narratoai/resource/videos/
+services/.venv/
+/models/
+
+# 系统
+.DS_Store
+
+ms-playwright
+.playwright-mcp/
