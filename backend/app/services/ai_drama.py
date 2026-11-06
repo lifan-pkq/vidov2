@@ -617,6 +617,8 @@ def _run(project_id: str) -> None:
     project = load_project(project_id)
     task_id = project.get("task_id")
     task = task_manager.get(task_id) if task_id else None
+    if task:
+        task.status = "running"
     try:
         project["status"] = "running"
         _set_stage(project, "分析小说：提取角色与分集大纲", 2)
